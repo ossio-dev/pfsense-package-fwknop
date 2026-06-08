@@ -1,0 +1,9 @@
+The pfSense fwknop package provides GUI configuration and service integration
+for fwknopd Single Packet Authorization.
+
+It manages fwknopd settings, protected access stanzas, and package-generated
+PF table allow rules so authenticated SPA clients can be added to temporary
+allow tables without editing normal pfSense firewall rule arrays.
+
+SPA can reduce exposed service surface area, but it is not a replacement for a
+VPN or for strong service authentication.

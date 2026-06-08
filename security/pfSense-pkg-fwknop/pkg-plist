@@ -1,0 +1,9 @@
+pkg/fwknop.xml
+pkg/fwknop.inc
+/etc/inc/priv/fwknop.priv.inc
+www/packages/fwknop/index.php
+www/packages/fwknop/edit.php
+www/packages/fwknop/status.php
+%%DATADIR%%/info.xml
+@dir /etc/inc/priv
+@dir /etc/inc
