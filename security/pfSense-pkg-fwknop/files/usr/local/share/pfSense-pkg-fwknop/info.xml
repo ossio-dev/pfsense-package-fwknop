@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<pfsensepkgs>
+	<package>
+		<name>fwknop</name>
+		<website>https://www.freshports.org/security/fwknop/</website>
+		<descr><![CDATA[
+		Single Packet Authorization using fwknopd with pfSense service,
+		WebGUI, and managed PF table integration.
+		]]></descr>
+		<version>%%PKGVERSION%%</version>
+		<configurationfile>fwknop.xml</configurationfile>
+	</package>
+</pfsensepkgs>

@@ -747,3 +747,338 @@ function fwknop_comment_value($value) {
 	$value = fwknop_safe_directive_value($value);
 	return $value !== '' ? $value : 'fwknop access rule';
 }
+
+function fwknop_generate_package_rules($type = "filter") {
+	if (!in_array($type, ['filter', 'rule'], true)) {
+		return '';
+	}
+
+	$settings = fwknop_get_settings();
+	if (!fwknop_is_enabled($settings) ||
+	    !fwknop_is_enabled(fwknop_array_get($settings, 'managed_pf_table_mode', 'on'))) {
+		return '';
+	}
+
+	$interfaces = fwknop_pf_interfaces($settings);
+	if (empty($interfaces)) {
+		fwknop_log_warning('Cannot generate fwknop package rules: no valid listen interfaces are configured.');
+		return '';
+	}
+
+	$rules = '';
+	$declared_tables = [];
+	foreach (fwknop_get_access_rules() as $index => $rule) {
+		if (!fwknop_is_enabled(fwknop_array_get($rule, 'enabled', fwknop_array_get($rule, 'enable', 'on')))) {
+			continue;
+		}
+
+		$table = fwknop_table_name_for_rule($rule, $index);
+		if (!fwknop_is_valid_table_name($table)) {
+			fwknop_log_warning("Skipping fwknop rule with invalid table name: {$table}");
+			continue;
+		}
+
+		$protocol = strtolower((string)fwknop_array_get($rule, 'protocol', ''));
+		if (!in_array($protocol, ['tcp', 'udp'], true)) {
+			continue;
+		}
+
+		$port = fwknop_pf_port_for_rule($rule);
+		if ($port === '') {
+			continue;
+		}
+
+		if (!isset($declared_tables[$table])) {
+			$rules .= "table <{$table}> persist\n";
+			$declared_tables[$table] = true;
+		}
+
+		$description = fwknop_comment_value((string)fwknop_array_get($rule, 'description', "Rule {$index}"));
+		$label = fwknop_pf_label($description);
+		foreach ($interfaces as $interface) {
+			$destination = fwknop_pf_destination_for_rule($rule, $interface['real']);
+			if ($destination === '') {
+				continue;
+			}
+
+			fwknop_warn_if_service_exposed($interface['friendly'], $rule, $protocol, $port, $description);
+			$rules .= "pass in quick on {$interface['real']} proto {$protocol} from <{$table}> to {$destination} port {$port} keep state label \"fwknop: {$label}\"\n";
+		}
+	}
+
+	return $rules;
+}
+
+function fwknop_write_table_helper() {
+	$directory = dirname(FWKNOP_TABLE_HELPER);
+	if (!is_dir($directory)) {
+		if (function_exists('safe_mkdir')) {
+			safe_mkdir($directory);
+		} else {
+			mkdir($directory, 0755, true);
+		}
+	}
+
+	$temp = tempnam($directory, '.fwknop-table.');
+	if ($temp === false) {
+		throw new RuntimeException('Unable to create temporary fwknop table helper.');
+	}
+
+	if (file_put_contents($temp, fwknop_table_helper_source(), LOCK_EX) === false) {
+		unlink($temp);
+		throw new RuntimeException('Unable to write temporary fwknop table helper.');
+	}
+
+	@chown($temp, 'root');
+	@chgrp($temp, 'wheel');
+	chmod($temp, 0755);
+
+	if (!rename($temp, FWKNOP_TABLE_HELPER)) {
+		unlink($temp);
+		throw new RuntimeException('Unable to activate fwknop table helper.');
+	}
+
+	chmod(FWKNOP_TABLE_HELPER, 0755);
+	return FWKNOP_TABLE_HELPER;
+}
+
+function fwknop_pf_interfaces($settings) {
+	$result = [];
+	foreach (fwknop_normalize_list(fwknop_array_get($settings, 'listen_interfaces', '')) as $friendly) {
+		if (!fwknop_is_valid_interface($friendly)) {
+			continue;
+		}
+		$real = function_exists('get_real_interface') ? get_real_interface($friendly) : $friendly;
+		if ($real === '' || !preg_match('/^[A-Za-z0-9_.:-]+$/', $real)) {
+			continue;
+		}
+		$result[] = [
+			'friendly' => $friendly,
+			'real' => $real
+		];
+	}
+
+	return $result;
+}
+
+function fwknop_pf_port_for_rule($rule) {
+	$port = trim((string)fwknop_array_get($rule, 'destination_port', ''));
+	if (fwknop_is_port($port)) {
+		return $port;
+	}
+	if (fwknop_is_alias_of_type($port, ['port'])) {
+		return '$' . $port;
+	}
+
+	return '';
+}
+
+function fwknop_pf_destination_for_rule($rule, $real_interface) {
+	$type = strtolower((string)fwknop_array_get($rule, 'destination_type', 'firewall'));
+	$value = trim((string)fwknop_array_get($rule, 'destination_value', ''));
+
+	switch ($type) {
+		case 'firewall':
+			return "({$real_interface})";
+		case 'interface':
+			if (!fwknop_is_valid_interface($value)) {
+				return '';
+			}
+			$destination_interface = function_exists('get_real_interface') ? get_real_interface($value) : $value;
+			return $destination_interface !== '' ? "({$destination_interface})" : '';
+		case 'host':
+			if ((function_exists('is_ipaddr') && is_ipaddr($value)) ||
+			    (function_exists('is_subnet') && is_subnet($value)) ||
+			    filter_var($value, FILTER_VALIDATE_IP) !== false ||
+			    fwknop_is_subnet($value)) {
+				return fwknop_safe_directive_value($value);
+			}
+			return '';
+		case 'alias':
+			return fwknop_is_alias_of_type($value, ['host', 'network']) ? '$' . $value : '';
+	}
+
+	return '';
+}
+
+function fwknop_pf_label($description) {
+	return str_replace(['\\', '"'], ['\\\\', '\"'], fwknop_comment_value($description));
+}
+
+function fwknop_warn_if_service_exposed($interface, $fwknop_rule, $protocol, $port, $description) {
+	foreach (fwknop_find_exposing_firewall_rules($interface, $fwknop_rule, $protocol, $port) as $rule_descr) {
+		fwknop_log_warning("fwknop protected service '{$description}' may already be exposed by normal firewall rule '{$rule_descr}'.");
+	}
+}
+
+function fwknop_find_exposing_firewall_rules($interface, $fwknop_rule, $protocol, $port) {
+	$matches = [];
+	$filter_rules = config_get_path('filter/rule', []);
+	if (!is_array($filter_rules)) {
+		return $matches;
+	}
+
+	foreach ($filter_rules as $rule) {
+		if (!is_array($rule) || fwknop_is_enabled(fwknop_array_get($rule, 'disabled', 'off'))) {
+			continue;
+		}
+		if (strtolower((string)fwknop_array_get($rule, 'type', 'pass')) !== 'pass') {
+			continue;
+		}
+		if (!fwknop_filter_rule_matches_interface($rule, $interface) ||
+		    !fwknop_filter_rule_matches_protocol($rule, $protocol) ||
+		    !fwknop_filter_rule_matches_port($rule, $port) ||
+		    !fwknop_filter_rule_matches_destination($rule, $fwknop_rule)) {
+			continue;
+		}
+
+		$matches[] = fwknop_comment_value((string)fwknop_array_get($rule, 'descr', 'unnamed rule'));
+	}
+
+	return $matches;
+}
+
+function fwknop_filter_rule_matches_interface($rule, $interface) {
+	$rule_interface = fwknop_array_get($rule, 'interface', '');
+	if ($rule_interface === '' || $rule_interface === 'any') {
+		return true;
+	}
+
+	return in_array($interface, fwknop_normalize_list($rule_interface), true);
+}
+
+function fwknop_filter_rule_matches_protocol($rule, $protocol) {
+	$rule_protocol = strtolower((string)fwknop_array_get($rule, 'protocol', ''));
+	return $rule_protocol === '' || $rule_protocol === 'any' || $rule_protocol === $protocol;
+}
+
+function fwknop_filter_rule_matches_port($rule, $port) {
+	$destination = fwknop_array_get($rule, 'destination', []);
+	$rule_port = trim((string)fwknop_array_get($destination, 'port', ''));
+	if ($rule_port === '') {
+		return true;
+	}
+	if ($rule_port === $port) {
+		return true;
+	}
+	if ($port !== '' && $port[0] === '$') {
+		return '$' . $rule_port === $port;
+	}
+
+	return false;
+}
+
+function fwknop_filter_rule_matches_destination($rule, $fwknop_rule) {
+	$destination = fwknop_array_get($rule, 'destination', []);
+	$rule_address = trim((string)fwknop_array_get($destination, 'address', ''));
+	if ($rule_address === '' || $rule_address === 'any') {
+		return true;
+	}
+
+	$fwknop_type = strtolower((string)fwknop_array_get($fwknop_rule, 'destination_type', 'firewall'));
+	$fwknop_value = trim((string)fwknop_array_get($fwknop_rule, 'destination_value', ''));
+	if ($fwknop_type === 'firewall') {
+		return in_array($rule_address, ['self', 'This Firewall'], true);
+	}
+
+	return $rule_address === $fwknop_value;
+}
+
+function fwknop_log_warning($message) {
+	if (function_exists('logger')) {
+		logger(LOG_WARNING, function_exists('localize_text') ? localize_text($message) : $message, LOG_PREFIX_PKG_FWKNOP);
+	}
+}
+
+function fwknop_table_helper_source() {
+	return <<<'PHP'
+#!/usr/local/bin/php
+<?php
+
+const FWKNOP_HELPER_PFCTL = '/sbin/pfctl';
+const FWKNOP_HELPER_LOGGER = '/usr/bin/logger';
+const FWKNOP_HELPER_TAG = 'pfsense-fwknop-table';
+
+function fwknop_helper_fail($message) {
+	fwknop_helper_log('authpriv.warning', 'reject: ' . $message);
+	fwrite(STDERR, $message . PHP_EOL);
+	exit(1);
+}
+
+function fwknop_helper_log($priority, $message) {
+	$command = FWKNOP_HELPER_LOGGER .
+	    ' -p ' . escapeshellarg($priority) .
+	    ' -t ' . escapeshellarg(FWKNOP_HELPER_TAG) .
+	    ' ' . escapeshellarg($message);
+	exec($command, $output, $retval);
+}
+
+function fwknop_helper_valid_source($source) {
+	if (filter_var($source, FILTER_VALIDATE_IP) !== false) {
+		return true;
+	}
+
+	$parts = explode('/', $source, 2);
+	if (count($parts) !== 2 ||
+	    filter_var($parts[0], FILTER_VALIDATE_IP) === false ||
+	    !ctype_digit($parts[1])) {
+		return false;
+	}
+
+	$max_prefix = strpos($parts[0], ':') === false ? 32 : 128;
+	return (int)$parts[1] >= 0 && (int)$parts[1] <= $max_prefix;
+}
+
+function fwknop_helper_valid_port($port) {
+	return ctype_digit($port) && (int)$port >= 1 && (int)$port <= 65535;
+}
+
+if ($argc < 6) {
+	fwknop_helper_fail('usage: pfsense-fwknop-table open|close table source tcp|udp port [timeout]');
+}
+
+$action = $argv[1];
+$table = $argv[2];
+$source = $argv[3];
+$protocol = strtolower($argv[4]);
+$port = $argv[5];
+$timeout = $argv[6] ?? null;
+
+if (!in_array($action, ['open', 'close'], true)) {
+	fwknop_helper_fail('invalid action');
+}
+if (!preg_match('/^fwknop_[A-Za-z0-9_]+$/', $table)) {
+	fwknop_helper_fail('invalid table name');
+}
+if (!fwknop_helper_valid_source($source)) {
+	fwknop_helper_fail('invalid source address');
+}
+if (!in_array($protocol, ['tcp', 'udp'], true)) {
+	fwknop_helper_fail('invalid protocol');
+}
+if (!fwknop_helper_valid_port($port)) {
+	fwknop_helper_fail('invalid port');
+}
+if ($action === 'open' && ($timeout === null || !ctype_digit($timeout) || (int)$timeout < 1)) {
+	fwknop_helper_fail('invalid timeout');
+}
+if ($action === 'close' && $timeout !== null) {
+	fwknop_helper_fail('unexpected close timeout');
+}
+
+$pf_action = $action === 'open' ? 'add' : 'delete';
+$command = FWKNOP_HELPER_PFCTL .
+    ' -t ' . escapeshellarg($table) .
+    ' -T ' . $pf_action .
+    ' ' . escapeshellarg($source);
+exec($command, $output, $retval);
+
+if ($retval !== 0) {
+	fwknop_helper_log('authpriv.warning', "{$action} failed table={$table} source={$source} proto={$protocol} port={$port}");
+	exit($retval);
+}
+
+fwknop_helper_log('authpriv.notice', "{$action} table={$table} source={$source} proto={$protocol} port={$port}");
+exit(0);
+PHP;
+}

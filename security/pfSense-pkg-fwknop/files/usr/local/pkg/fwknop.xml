@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!DOCTYPE packagegui SYSTEM "./schema/packages.dtd">
+<?xml-stylesheet type="text/xsl" href="./xsl/package.xsl"?>
+<packagegui>
+	<copyright>
+	<![CDATA[
+/*
+ * fwknop.xml
+ *
+ * pfSense package GUI for fwknop Single Packet Authorization.
+ */
+	]]>
+	</copyright>
+	<name>fwknop</name>
+	<version>%%PKGVERSION%%</version>
+	<title>Services: fwknop</title>
+	<addedit_string>fwknop: changed settings</addedit_string>
+	<include_file>/usr/local/pkg/fwknop.inc</include_file>
+	<aftersaveredirect>/pkg_edit.php?xml=fwknop.xml</aftersaveredirect>
+	<menu>
+		<name>fwknop</name>
+		<tooltiptext>Modify fwknop Single Packet Authorization settings.</tooltiptext>
+		<section>Services</section>
+		<configfile>fwknop.xml</configfile>
+		<url>/pkg_edit.php?xml=fwknop.xml</url>
+	</menu>
+	<tabs>
+		<tab>
+			<text>Settings</text>
+			<url>/pkg_edit.php?xml=fwknop.xml</url>
+			<active/>
+		</tab>
+		<tab>
+			<text>Access Rules</text>
+			<url>/packages/fwknop/index.php</url>
+		</tab>
+		<tab>
+			<text>Clients / Keys</text>
+			<url>/packages/fwknop/edit.php</url>
+		</tab>
+		<tab>
+			<text>Status / Diagnostics</text>
+			<url>/packages/fwknop/status.php</url>
+		</tab>
+		<tab>
+			<text>Advanced Raw Config</text>
+			<url>/pkg_edit.php?xml=fwknop.xml</url>
+		</tab>
+	</tabs>
+	<service>
+		<name>fwknopd</name>
+		<rcfile>fwknopd</rcfile>
+		<executable>fwknopd</executable>
+		<description>fwknop Single Packet Authorization daemon</description>
+	</service>
+	<fields>
+		<field>
+			<name>General Settings</name>
+			<type>listtopic</type>
+		</field>
+		<field>
+			<fielddescr>Enable fwknop</fielddescr>
+			<fieldname>enabled</fieldname>
+			<type>select</type>
+			<default_value>off</default_value>
+			<options>
+				<option><name>Enabled</name><value>on</value></option>
+				<option><name>Disabled</name><value>off</value></option>
+			</options>
+		</field>
+		<field>
+			<fielddescr>Listen Interfaces</fielddescr>
+			<fieldname>listen_interfaces</fieldname>
+			<type>interfaces_selection</type>
+			<description>Select the interfaces where fwknopd should receive SPA packets.</description>
+			<multiple/>
+		</field>
+		<field>
+			<fielddescr>SPA Packet Port</fielddescr>
+			<fieldname>spa_port</fieldname>
+			<type>input</type>
+			<default_value>62201</default_value>
+			<description>UDP port used for incoming SPA packets.</description>
+			<required/>
+		</field>
+		<field>
+			<fielddescr>PCAP Filter Override</fielddescr>
+			<fieldname>pcap_filter_override</fieldname>
+			<type>input</type>
+			<description>Optional tcpdump-style packet capture filter. Leave blank to match the SPA packet port.</description>
+		</field>
+		<field>
+			<fielddescr>Log Level</fielddescr>
+			<fieldname>log_level</fieldname>
+			<type>select</type>
+			<default_value>0</default_value>
+			<options>
+				<option><name>Quiet</name><value>0</value></option>
+				<option><name>Info</name><value>1</value></option>
+				<option><name>Verbose</name><value>2</value></option>
+				<option><name>Debug</name><value>3</value></option>
+			</options>
+		</field>
+		<field>
+			<fielddescr>Syslog Logging</fielddescr>
+			<fieldname>syslog_enabled</fieldname>
+			<type>select</type>
+			<default_value>on</default_value>
+			<options>
+				<option><name>Enabled</name><value>on</value></option>
+				<option><name>Disabled</name><value>off</value></option>
+			</options>
+			<description>Log fwknopd messages through syslog.</description>
+		</field>
+		<field>
+			<fielddescr>Managed PF Table Mode</fielddescr>
+			<fieldname>managed_pf_table_mode</fieldname>
+			<type>select</type>
+			<default_value>on</default_value>
+			<options>
+				<option><name>Enabled</name><value>on</value></option>
+				<option><name>Disabled</name><value>off</value></option>
+			</options>
+			<description>Generate package PF tables and use the package helper for temporary SPA access.</description>
+		</field>
+		<field>
+			<name>Access Rules and Clients</name>
+			<type>listtopic</type>
+		</field>
+		<field>
+			<name>Advanced Raw Config</name>
+			<type>listtopic</type>
+		</field>
+		<field>
+			<fielddescr>Allow Raw Advanced Config</fielddescr>
+			<fieldname>allow_raw_advanced_config</fieldname>
+			<type>checkbox</type>
+			<default_value>off</default_value>
+			<description>Append raw fwknopd.conf lines after generated settings.</description>
+		</field>
+		<field>
+			<fielddescr>Raw Advanced Config</fielddescr>
+			<fieldname>raw_advanced_config</fieldname>
+			<type>textarea</type>
+			<cols>65</cols>
+			<rows>8</rows>
+		</field>
+	</fields>
+	<custom_php_install_command>
+		fwknop_install_command();
+	</custom_php_install_command>
+	<custom_php_deinstall_command>
+		fwknop_deinstall_command();
+	</custom_php_deinstall_command>
+	<custom_php_resync_config_command>
+		fwknop_resync_config();
+	</custom_php_resync_config_command>
+	<custom_php_validation_command>
+		fwknop_validate_config($_POST, $input_errors);
+	</custom_php_validation_command>
+	<filter_rules_needed>fwknop_generate_package_rules</filter_rules_needed>
+</packagegui>

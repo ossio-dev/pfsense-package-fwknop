@@ -228,6 +228,8 @@ PublishScripts/
 *.snupkg
 # The packages folder can be ignored because of Package Restore
 **/[Pp]ackages/*
+!security/pfSense-pkg-fwknop/files/usr/local/www/packages/fwknop/
+!security/pfSense-pkg-fwknop/files/usr/local/www/packages/fwknop/*.php
 # except build/, which is used as an MSBuild target.
 !**/[Pp]ackages/build/
 # Uncomment if necessary however generally it will be regenerated when needed
@@ -430,4 +432,3 @@ FodyWeavers.xsd
 
 
 INSTRUCTIONS
-
