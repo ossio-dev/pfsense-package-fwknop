@@ -1,0 +1,749 @@
+<?php
+/*
+ * fwknop.inc
+ *
+ * pfSense package integration for fwknopd Single Packet Authorization.
+ */
+
+require_once("config.inc");
+require_once("filter.inc");
+require_once("interfaces.inc");
+require_once("service-utils.inc");
+require_once("services.inc");
+require_once("util.inc");
+
+define('FWKNOP_CONFIG_PATH', 'installedpackages/fwknop/config/0');
+define('FWKNOP_RULE_PATH', 'installedpackages/fwknop/accessrule');
+define('FWKNOP_LEGACY_RULE_PATH', 'installedpackages/fwknop/rule');
+define('FWKNOP_ETCDIR', '/usr/local/etc/fwknop');
+define('FWKNOP_ACCESS_D_DIR', FWKNOP_ETCDIR . '/access.d');
+define('FWKNOP_FWKNOPD_CONF', FWKNOP_ETCDIR . '/fwknopd.conf');
+define('FWKNOP_ACCESS_CONF', FWKNOP_ETCDIR . '/access.conf');
+define('FWKNOP_TABLE_HELPER', '/usr/local/sbin/pfsense-fwknop-table');
+define('FWKNOP_RC_SCRIPT', '/usr/local/etc/rc.d/fwknopd');
+define('LOG_PREFIX_PKG_FWKNOP', 'fwknop');
+
+function fwknop_default_settings() {
+	return [
+		'enabled' => 'off',
+		'listen_interfaces' => '',
+		'spa_port' => '62201',
+		'pcap_filter_override' => '',
+		'log_level' => '0',
+		'syslog_enabled' => 'on',
+		'managed_pf_table_mode' => 'on',
+		'allow_raw_advanced_config' => 'off',
+		'raw_advanced_config' => ''
+	];
+}
+
+function fwknop_get_settings() {
+	$settings = config_get_path(FWKNOP_CONFIG_PATH, []);
+	if (!is_array($settings)) {
+		$settings = [];
+	}
+
+	return array_replace(fwknop_default_settings(), $settings);
+}
+
+function fwknop_install_command() {
+	fwknop_make_directories();
+
+	$changed = false;
+	foreach (fwknop_default_settings() as $key => $value) {
+		if (config_get_path(FWKNOP_CONFIG_PATH . "/{$key}") === null) {
+			config_set_path(FWKNOP_CONFIG_PATH . "/{$key}", $value);
+			$changed = true;
+		}
+	}
+
+	if ($changed) {
+		write_config('fwknop package defaults installed');
+	}
+
+	fwknop_resync_config();
+}
+
+function fwknop_deinstall_command() {
+	fwknop_stop();
+	fwknop_remove_generated_files();
+}
+
+function fwknop_resync_config() {
+	$settings = fwknop_get_settings();
+
+	if (!fwknop_is_enabled($settings)) {
+		fwknop_stop();
+		fwknop_remove_generated_files();
+		return;
+	}
+
+	fwknop_make_directories();
+	fwknop_generate_fwknopd_conf();
+	fwknop_generate_access_conf();
+
+	if (function_exists('fwknop_write_table_helper')) {
+		fwknop_write_table_helper();
+	}
+
+	if (!function_exists('platform_booting') || !platform_booting()) {
+		fwknop_restart();
+	}
+}
+
+function fwknop_validate_config($post, &$input_errors) {
+	$settings = array_replace(fwknop_default_settings(), is_array($post) ? $post : []);
+	$spa_port = fwknop_array_get($settings, 'spa_port', '62201');
+
+	if (!fwknop_is_port($spa_port)) {
+		$input_errors[] = gettext("The SPA packet port must be a number from 1 through 65535.");
+	}
+
+	$listen_interfaces = fwknop_normalize_list(fwknop_array_get($settings, 'listen_interfaces', fwknop_array_get($settings, 'interface', [])));
+	if (fwknop_is_enabled($settings) && empty($listen_interfaces)) {
+		$input_errors[] = gettext("Select at least one interface for fwknopd to listen on.");
+	}
+	foreach ($listen_interfaces as $interface) {
+		if (!fwknop_is_valid_interface($interface)) {
+			$input_errors[] = sprintf(gettext("The listen interface '%s' is not a valid pfSense interface."), $interface);
+		}
+	}
+
+	$pcap_filter = trim((string)fwknop_array_get($settings, 'pcap_filter_override', ''));
+	if (!fwknop_is_safe_config_value($pcap_filter, true)) {
+		$input_errors[] = gettext("The packet capture filter override contains invalid control characters.");
+	}
+
+	$log_level = (string)fwknop_array_get($settings, 'log_level', '0');
+	if (!fwknop_normalize_log_level($log_level, true)) {
+		$input_errors[] = gettext("The log level must be one of 0, 1, 2, 3, info, verbose, or debug.");
+	}
+
+	if (fwknop_is_enabled(fwknop_array_get($settings, 'allow_raw_advanced_config', 'off'))) {
+		$raw_config = (string)fwknop_array_get($settings, 'raw_advanced_config', '');
+		if (strpos($raw_config, "\0") !== false) {
+			$input_errors[] = gettext("Advanced raw configuration must not contain NUL bytes.");
+		}
+	}
+
+	foreach (fwknop_get_posted_access_rules($post) as $index => $rule) {
+		fwknop_validate_access_rule($rule, $index, $input_errors);
+	}
+}
+
+function fwknop_service_status() {
+	if (function_exists('is_service_running')) {
+		return is_service_running('fwknopd');
+	}
+	if (function_exists('isvalidproc')) {
+		return isvalidproc('fwknopd');
+	}
+	if (function_exists('mwexec')) {
+		return mwexec('/bin/pgrep -anf ' . escapeshellarg('fwknopd')) == 0;
+	}
+
+	return false;
+}
+
+function fwknop_start() {
+	if (function_exists('start_service')) {
+		return start_service('fwknopd');
+	}
+	if (file_exists(FWKNOP_RC_SCRIPT) && function_exists('mwexec')) {
+		return mwexec(FWKNOP_RC_SCRIPT . ' start');
+	}
+
+	return false;
+}
+
+function fwknop_stop() {
+	if (function_exists('stop_service')) {
+		return stop_service('fwknopd');
+	}
+	if (file_exists(FWKNOP_RC_SCRIPT) && function_exists('mwexec')) {
+		return mwexec(FWKNOP_RC_SCRIPT . ' stop');
+	}
+
+	return false;
+}
+
+function fwknop_restart() {
+	if (function_exists('restart_service')) {
+		return restart_service('fwknopd');
+	}
+	if (file_exists(FWKNOP_RC_SCRIPT) && function_exists('mwexec')) {
+		return mwexec(FWKNOP_RC_SCRIPT . ' restart');
+	}
+
+	fwknop_stop();
+	return fwknop_start();
+}
+
+function fwknop_generate_fwknopd_conf() {
+	$settings = fwknop_get_settings();
+	$content = fwknop_build_fwknopd_conf($settings);
+
+	fwknop_atomic_write(FWKNOP_FWKNOPD_CONF, $content, 0644);
+	return FWKNOP_FWKNOPD_CONF;
+}
+
+function fwknop_generate_access_conf() {
+	$rules = fwknop_get_access_rules();
+	$content = fwknop_build_access_conf($rules);
+
+	fwknop_atomic_write(FWKNOP_ACCESS_CONF, $content, 0600);
+	return FWKNOP_ACCESS_CONF;
+}
+
+function fwknop_build_fwknopd_conf($settings) {
+	$settings = array_replace(fwknop_default_settings(), is_array($settings) ? $settings : []);
+	$spa_port = fwknop_is_port($settings['spa_port']) ? $settings['spa_port'] : '62201';
+	$interfaces = fwknop_get_real_interfaces(fwknop_normalize_list($settings['listen_interfaces']));
+	$pcap_interface = reset($interfaces);
+	$pcap_filter = trim((string)$settings['pcap_filter_override']);
+	if ($pcap_filter === '') {
+		$pcap_filter = "udp port {$spa_port}";
+	}
+
+	$lines = [
+		'# This file is generated by the pfSense fwknop package.',
+		'# Manual edits will be overwritten.',
+		'VERBOSE ' . fwknop_normalize_log_level($settings['log_level']) . ';'
+	];
+
+	if (!empty($pcap_interface)) {
+		$lines[] = "PCAP_INTF {$pcap_interface};";
+		if (count($interfaces) > 1) {
+			$lines[] = '# Additional selected interfaces: ' . implode(', ', array_slice($interfaces, 1));
+		}
+	}
+
+	$lines[] = 'ENABLE_PCAP_PROMISC N;';
+	$lines[] = "PCAP_FILTER {$pcap_filter};";
+	$lines[] = 'ENABLE_UDP_SERVER Y;';
+	$lines[] = "UDPSERV_PORT {$spa_port};";
+	$lines[] = 'ENABLE_TCP_SERVER N;';
+	if (fwknop_is_enabled($settings['syslog_enabled'])) {
+		$lines[] = 'SYSLOG_IDENTITY fwknopd;';
+		$lines[] = 'SYSLOG_FACILITY LOG_DAEMON;';
+	}
+	$lines[] = 'ENABLE_SPA_PACKET_AGING Y;';
+	$lines[] = 'MAX_SPA_PACKET_AGE 120;';
+
+	if (fwknop_is_enabled($settings['allow_raw_advanced_config']) &&
+	    trim((string)$settings['raw_advanced_config']) !== '') {
+		$lines[] = '';
+		$lines[] = '# Advanced raw configuration from pfSense fwknop settings.';
+		$lines[] = rtrim((string)$settings['raw_advanced_config']);
+	}
+
+	return implode("\n", $lines) . "\n";
+}
+
+function fwknop_build_access_conf($rules) {
+	$lines = [
+		'# This file is generated by the pfSense fwknop package.',
+		'# It contains key material and must remain readable only by root.',
+		''
+	];
+
+	foreach (fwknop_normalize_rule_list($rules) as $index => $rule) {
+		if (!fwknop_is_enabled(fwknop_array_get($rule, 'enabled', fwknop_array_get($rule, 'enable', 'on')))) {
+			continue;
+		}
+
+		$table = fwknop_table_name_for_rule($rule, $index);
+		if (!fwknop_is_valid_table_name($table)) {
+			continue;
+		}
+
+		$protocol = strtolower((string)fwknop_array_get($rule, 'protocol', 'tcp'));
+		if (!in_array($protocol, ['tcp', 'udp'])) {
+			continue;
+		}
+
+		$ports = fwknop_open_ports_for_rule($rule, $protocol);
+		if (empty($ports)) {
+			continue;
+		}
+
+		$timeout = fwknop_positive_int(fwknop_array_get($rule, 'timeout_seconds', '30'), 30);
+		$source = fwknop_source_for_rule($rule);
+		$destination = fwknop_destination_for_rule($rule);
+		$description = fwknop_comment_value((string)fwknop_array_get($rule, 'description', "Rule {$index}"));
+		$encryption_key = trim((string)fwknop_array_get($rule, 'encryption_key', ''));
+		$hmac_key = trim((string)fwknop_array_get($rule, 'hmac_key', ''));
+
+		if ($encryption_key === '' || $hmac_key === '') {
+			continue;
+		}
+
+		$lines[] = "# {$description}";
+		$lines[] = "SOURCE {$source};";
+		if ($destination !== '') {
+			$lines[] = "DESTINATION {$destination};";
+		}
+		$lines[] = 'OPEN_PORTS ' . implode(',', $ports) . ';';
+		$lines[] = "FW_ACCESS_TIMEOUT {$timeout};";
+		$lines[] = 'REQUIRE_SOURCE_ADDRESS Y;';
+		$lines[] = "KEY_BASE64 {$encryption_key};";
+		$lines[] = "HMAC_KEY_BASE64 {$hmac_key};";
+		$lines[] = "CMD_CYCLE_OPEN " . FWKNOP_TABLE_HELPER . " open {$table} " . '$SRC $PROTO $PORT $CLIENT_TIMEOUT' . ';';
+		$lines[] = "CMD_CYCLE_CLOSE " . FWKNOP_TABLE_HELPER . " close {$table} " . '$SRC $PROTO $PORT' . ';';
+		$lines[] = '';
+	}
+
+	return implode("\n", $lines);
+}
+
+function fwknop_validate_access_rule($rule, $index, &$input_errors) {
+	if (!is_array($rule) ||
+	    !fwknop_is_enabled(fwknop_array_get($rule, 'enabled', fwknop_array_get($rule, 'enable', 'on')))) {
+		return;
+	}
+
+	$description = trim((string)fwknop_array_get($rule, 'description', ''));
+	if ($description === '' || !fwknop_is_safe_config_value($description, true)) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d needs a safe description."), $index + 1);
+	}
+
+	$source_type = strtolower((string)fwknop_array_get($rule, 'source_constraint_type', 'any'));
+	$source_value = trim((string)fwknop_array_get($rule, 'source_constraint_value', ''));
+	if (!in_array($source_type, ['any', 'ip', 'cidr', 'alias'])) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d has an invalid source constraint type."), $index + 1);
+	} elseif (!fwknop_validate_source_constraint($source_type, $source_value)) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d has an invalid source constraint."), $index + 1);
+	}
+
+	$destination_type = strtolower((string)fwknop_array_get($rule, 'destination_type', 'firewall'));
+	$destination_value = trim((string)fwknop_array_get($rule, 'destination_value', ''));
+	if (!in_array($destination_type, ['firewall', 'interface', 'host', 'alias'])) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d has an invalid destination type."), $index + 1);
+	} elseif (!fwknop_validate_destination($destination_type, $destination_value)) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d has an invalid destination."), $index + 1);
+	}
+
+	$protocol = strtolower((string)fwknop_array_get($rule, 'protocol', ''));
+	if (!in_array($protocol, ['tcp', 'udp'])) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d protocol must be tcp or udp."), $index + 1);
+	}
+
+	$destination_port = trim((string)fwknop_array_get($rule, 'destination_port', ''));
+	if (!fwknop_validate_port_or_alias($destination_port)) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d has an invalid destination port or port alias."), $index + 1);
+	}
+
+	$timeout = fwknop_array_get($rule, 'timeout_seconds', '');
+	if (!fwknop_is_positive_int($timeout)) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d timeout must be a positive integer."), $index + 1);
+	}
+
+	$table = trim((string)fwknop_array_get($rule, 'table_name', ''));
+	if ($table !== '' && !fwknop_is_valid_table_name($table)) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d has an invalid generated table name."), $index + 1);
+	}
+
+	if (!fwknop_is_base64_key(fwknop_array_get($rule, 'encryption_key', ''))) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d needs a valid base64 encryption key."), $index + 1);
+	}
+	if (!fwknop_is_base64_key(fwknop_array_get($rule, 'hmac_key', ''))) {
+		$input_errors[] = sprintf(gettext("fwknop access rule %d needs a valid base64 HMAC key."), $index + 1);
+	}
+}
+
+function fwknop_make_directories() {
+	if (function_exists('safe_mkdir')) {
+		safe_mkdir(FWKNOP_ETCDIR);
+		safe_mkdir(FWKNOP_ACCESS_D_DIR);
+	} else {
+		if (!is_dir(FWKNOP_ETCDIR)) {
+			mkdir(FWKNOP_ETCDIR, 0700, true);
+		}
+		if (!is_dir(FWKNOP_ACCESS_D_DIR)) {
+			mkdir(FWKNOP_ACCESS_D_DIR, 0700, true);
+		}
+	}
+
+	@chmod(FWKNOP_ETCDIR, 0700);
+	@chmod(FWKNOP_ACCESS_D_DIR, 0700);
+}
+
+function fwknop_remove_generated_files() {
+	if (function_exists('unlink_if_exists')) {
+		unlink_if_exists(FWKNOP_FWKNOPD_CONF);
+		unlink_if_exists(FWKNOP_ACCESS_CONF);
+	} else {
+		if (file_exists(FWKNOP_FWKNOPD_CONF)) {
+			unlink(FWKNOP_FWKNOPD_CONF);
+		}
+		if (file_exists(FWKNOP_ACCESS_CONF)) {
+			unlink(FWKNOP_ACCESS_CONF);
+		}
+	}
+
+	if (is_dir(FWKNOP_ACCESS_D_DIR)) {
+		foreach (glob(FWKNOP_ACCESS_D_DIR . '/*.conf') as $file) {
+			if (function_exists('unlink_if_exists')) {
+				unlink_if_exists($file);
+			} else {
+				unlink($file);
+			}
+		}
+		@rmdir(FWKNOP_ACCESS_D_DIR);
+	}
+}
+
+function fwknop_atomic_write($path, $content, $mode) {
+	$directory = dirname($path);
+	if (!is_dir($directory)) {
+		fwknop_make_directories();
+	}
+
+	$temp = tempnam($directory, '.fwknop.');
+	if ($temp === false) {
+		throw new RuntimeException("Unable to create temporary file for {$path}");
+	}
+
+	if (file_put_contents($temp, $content, LOCK_EX) === false) {
+		unlink($temp);
+		throw new RuntimeException("Unable to write temporary file for {$path}");
+	}
+
+	@chown($temp, 'root');
+	@chgrp($temp, 'wheel');
+	chmod($temp, $mode);
+
+	if (!rename($temp, $path)) {
+		unlink($temp);
+		throw new RuntimeException("Unable to activate generated file {$path}");
+	}
+
+	chmod($path, $mode);
+}
+
+function fwknop_get_access_rules() {
+	$rules = config_get_path(FWKNOP_RULE_PATH, []);
+	if (empty($rules)) {
+		$rules = config_get_path(FWKNOP_LEGACY_RULE_PATH, []);
+	}
+
+	return fwknop_normalize_rule_list($rules);
+}
+
+function fwknop_get_posted_access_rules($post) {
+	if (!is_array($post)) {
+		return [];
+	}
+
+	foreach (['accessrule', 'rule', 'rules'] as $key) {
+		if (isset($post[$key])) {
+			return fwknop_normalize_rule_list($post[$key]);
+		}
+	}
+
+	if (isset($post['protocol']) || isset($post['destination_port']) ||
+	    isset($post['encryption_key']) || isset($post['hmac_key'])) {
+		return [$post];
+	}
+
+	return [];
+}
+
+function fwknop_normalize_rule_list($rules) {
+	if (!is_array($rules)) {
+		return [];
+	}
+	if (isset($rules['item']) && is_array($rules['item'])) {
+		$rules = $rules['item'];
+	}
+	if (isset($rules['config']) && is_array($rules['config'])) {
+		$rules = $rules['config'];
+	}
+	if (isset($rules['description']) || isset($rules['destination_port'])) {
+		return [$rules];
+	}
+
+	$normalized = [];
+	foreach ($rules as $rule) {
+		if (is_array($rule)) {
+			$normalized[] = $rule;
+		}
+	}
+
+	return $normalized;
+}
+
+function fwknop_array_get($array, $path, $default = null) {
+	if (function_exists('array_get_path')) {
+		return array_get_path($array, $path, $default);
+	}
+	if (!is_array($array)) {
+		return $default;
+	}
+	$parts = explode('/', $path);
+	$value = $array;
+	foreach ($parts as $part) {
+		if (!is_array($value) || !array_key_exists($part, $value)) {
+			return $default;
+		}
+		$value = $value[$part];
+	}
+
+	return $value;
+}
+
+function fwknop_is_enabled($value) {
+	if (is_array($value)) {
+		$value = fwknop_array_get($value, 'enabled', fwknop_array_get($value, 'enable', 'off'));
+	}
+
+	return in_array(strtolower((string)$value), ['1', 'on', 'yes', 'true', 'enabled'], true);
+}
+
+function fwknop_normalize_list($value) {
+	if (is_array($value)) {
+		$list = $value;
+	} else {
+		$list = explode(',', (string)$value);
+	}
+
+	$result = [];
+	foreach ($list as $item) {
+		$item = trim((string)$item);
+		if ($item !== '') {
+			$result[] = $item;
+		}
+	}
+
+	return array_values(array_unique($result));
+}
+
+function fwknop_is_valid_interface($interface) {
+	if (!preg_match('/^[A-Za-z0-9_.:-]+$/', (string)$interface)) {
+		return false;
+	}
+	if (function_exists('get_real_interface')) {
+		return get_real_interface($interface) !== '';
+	}
+
+	return true;
+}
+
+function fwknop_get_real_interfaces($interfaces) {
+	$result = [];
+	foreach ($interfaces as $interface) {
+		if (!fwknop_is_valid_interface($interface)) {
+			continue;
+		}
+		$result[] = function_exists('get_real_interface') ? get_real_interface($interface) : $interface;
+	}
+
+	return array_values(array_unique(array_filter($result)));
+}
+
+function fwknop_is_port($value) {
+	if (function_exists('is_port')) {
+		return is_port($value);
+	}
+
+	return ctype_digit((string)$value) && (int)$value >= 1 && (int)$value <= 65535;
+}
+
+function fwknop_is_positive_int($value) {
+	if (function_exists('is_numericint')) {
+		return is_numericint($value) && (int)$value > 0;
+	}
+
+	return ctype_digit((string)$value) && (int)$value > 0;
+}
+
+function fwknop_positive_int($value, $default) {
+	return fwknop_is_positive_int($value) ? (int)$value : (int)$default;
+}
+
+function fwknop_normalize_log_level($value, $validate_only = false) {
+	$map = [
+		'quiet' => '0',
+		'error' => '0',
+		'warn' => '0',
+		'warning' => '0',
+		'notice' => '1',
+		'info' => '1',
+		'verbose' => '2',
+		'debug' => '3'
+	];
+	$value = strtolower(trim((string)$value));
+	if (isset($map[$value])) {
+		return $validate_only ? true : $map[$value];
+	}
+	if (in_array($value, ['0', '1', '2', '3'], true)) {
+		return $validate_only ? true : $value;
+	}
+
+	return $validate_only ? false : '0';
+}
+
+function fwknop_is_safe_config_value($value, $allow_empty = false) {
+	$value = (string)$value;
+	if ($allow_empty && $value === '') {
+		return true;
+	}
+
+	return !preg_match('/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/', $value) &&
+	    strpos($value, "\n") === false &&
+	    strpos($value, "\r") === false &&
+	    strpos($value, ';') === false;
+}
+
+function fwknop_is_safe_alias_name($value) {
+	return is_string($value) && preg_match('/^[A-Za-z0-9_]+$/', $value);
+}
+
+function fwknop_is_alias_of_type($alias, $allowed_types) {
+	if (!fwknop_is_safe_alias_name($alias)) {
+		return false;
+	}
+	if (function_exists('is_alias') && !is_alias($alias)) {
+		return false;
+	}
+	if (function_exists('alias_get_type')) {
+		return in_array(alias_get_type($alias), $allowed_types, true);
+	}
+
+	return true;
+}
+
+function fwknop_validate_source_constraint($type, $value) {
+	switch ($type) {
+		case 'any':
+			return $value === '';
+		case 'ip':
+			return function_exists('is_ipaddr') ? is_ipaddr($value) : filter_var($value, FILTER_VALIDATE_IP) !== false;
+		case 'cidr':
+			return function_exists('is_subnet') ? is_subnet($value) : fwknop_is_subnet($value);
+		case 'alias':
+			return fwknop_is_alias_of_type($value, ['host', 'network']);
+	}
+
+	return false;
+}
+
+function fwknop_validate_destination($type, $value) {
+	switch ($type) {
+		case 'firewall':
+			return $value === '';
+		case 'interface':
+			return fwknop_is_valid_interface($value);
+		case 'host':
+			return (function_exists('is_ipaddr') ? is_ipaddr($value) : filter_var($value, FILTER_VALIDATE_IP) !== false) ||
+			    (function_exists('is_subnet') ? is_subnet($value) : fwknop_is_subnet($value));
+		case 'alias':
+			return fwknop_is_alias_of_type($value, ['host', 'network']);
+	}
+
+	return false;
+}
+
+function fwknop_validate_port_or_alias($value) {
+	if (fwknop_is_port($value)) {
+		return true;
+	}
+
+	return fwknop_is_alias_of_type($value, ['port']);
+}
+
+function fwknop_is_subnet($value) {
+	$parts = explode('/', (string)$value, 2);
+	if (count($parts) !== 2 || filter_var($parts[0], FILTER_VALIDATE_IP) === false ||
+	    !ctype_digit($parts[1])) {
+		return false;
+	}
+
+	$max = strpos($parts[0], ':') === false ? 32 : 128;
+	return (int)$parts[1] >= 0 && (int)$parts[1] <= $max;
+}
+
+function fwknop_is_base64_key($value) {
+	$value = trim((string)$value);
+	if (strlen($value) < 16 || !preg_match('/^[A-Za-z0-9+\/=]+$/', $value)) {
+		return false;
+	}
+
+	return base64_decode($value, true) !== false;
+}
+
+function fwknop_is_valid_table_name($table) {
+	return is_string($table) && preg_match('/^fwknop_[A-Za-z0-9_]+$/', $table);
+}
+
+function fwknop_table_name_for_rule($rule, $index) {
+	$table = trim((string)fwknop_array_get($rule, 'table_name', ''));
+	if (fwknop_is_valid_table_name($table)) {
+		return $table;
+	}
+
+	$rule_id = trim((string)fwknop_array_get($rule, 'ruleid', fwknop_array_get($rule, 'id', '')));
+	$rule_id = preg_replace('/[^A-Za-z0-9_]/', '_', $rule_id);
+	if ($rule_id === '') {
+		$rule_id = 'rule' . ($index + 1);
+	}
+
+	return 'fwknop_' . $rule_id;
+}
+
+function fwknop_open_ports_for_rule($rule, $protocol) {
+	$port = trim((string)fwknop_array_get($rule, 'destination_port', ''));
+	if (fwknop_is_port($port)) {
+		return ["{$protocol}/{$port}"];
+	}
+
+	if (!fwknop_is_alias_of_type($port, ['port']) || !function_exists('filter_expand_alias')) {
+		return [];
+	}
+
+	$ports = [];
+	foreach (preg_split('/[\s,]+/', trim(filter_expand_alias($port))) as $expanded_port) {
+		if (fwknop_is_port($expanded_port)) {
+			$ports[] = "{$protocol}/{$expanded_port}";
+		}
+	}
+
+	return array_values(array_unique($ports));
+}
+
+function fwknop_source_for_rule($rule) {
+	$type = strtolower((string)fwknop_array_get($rule, 'source_constraint_type', 'any'));
+	$value = trim((string)fwknop_array_get($rule, 'source_constraint_value', ''));
+	if ($type === 'any') {
+		return 'ANY';
+	}
+	if ($type === 'alias' && function_exists('filter_expand_alias')) {
+		$expanded = trim(filter_expand_alias($value));
+		return $expanded !== '' ? implode(',', preg_split('/[\s,]+/', $expanded)) : 'ANY';
+	}
+
+	return fwknop_safe_directive_value($value);
+}
+
+function fwknop_destination_for_rule($rule) {
+	$type = strtolower((string)fwknop_array_get($rule, 'destination_type', 'firewall'));
+	$value = trim((string)fwknop_array_get($rule, 'destination_value', ''));
+	if ($type === 'firewall' || $value === '') {
+		return '';
+	}
+	if ($type === 'alias' && function_exists('filter_expand_alias')) {
+		$expanded = trim(filter_expand_alias($value));
+		return $expanded !== '' ? implode(',', preg_split('/[\s,]+/', $expanded)) : '';
+	}
+
+	return fwknop_safe_directive_value($value);
+}
+
+function fwknop_safe_directive_value($value) {
+	return str_replace([';', "\r", "\n"], '', trim((string)$value));
+}
+
+function fwknop_comment_value($value) {
+	$value = fwknop_safe_directive_value($value);
+	return $value !== '' ? $value : 'fwknop access rule';
+}
