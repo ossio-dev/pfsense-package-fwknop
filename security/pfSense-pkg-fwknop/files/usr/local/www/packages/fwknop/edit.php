@@ -28,7 +28,7 @@ function fwknop_gui_tabs($active) {
 }
 
 function fwknop_gui_access_rules() {
-	return fwknop_normalize_rule_list(config_get_path(FWKNOP_RULE_PATH, array()));
+	return fwknop_get_access_rules();
 }
 
 function fwknop_gui_default_rule() {
@@ -159,7 +159,7 @@ if ($_POST) {
 				} else {
 					$rules[] = $rule;
 				}
-				config_set_path(FWKNOP_RULE_PATH, array_values($rules));
+				fwknop_set_access_rules($rules);
 				write_config(gettext("fwknop access rule saved"));
 				fwknop_resync_config();
 				header("Location: index.php");

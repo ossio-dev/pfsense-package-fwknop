@@ -12,6 +12,15 @@ function fwknop_gui_h($value) {
 	return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function fwknop_gui_runtime_missing_summary($components) {
+	$items = array();
+	foreach ($components as $component) {
+		$items[] = sprintf('%s (%s)', $component['name'], $component['path']);
+	}
+
+	return implode(', ', $items);
+}
+
 function fwknop_gui_tabs($active) {
 	$tab_array = array();
 	$tab_array[] = array(gettext("Settings"), $active == "settings", "/pkg_edit.php?xml=fwknop.xml");
@@ -111,6 +120,10 @@ if ($_POST && isset($_POST['act'])) {
 				$savemsg = gettext("fwknop configuration was resynchronized.");
 				break;
 			case 'restart':
+					if (!fwknop_runtime_available()) {
+						$input_errors[] = fwknop_runtime_status_message();
+						break;
+					}
 				fwknop_resync_config();
 				fwknop_restart();
 				$savemsg = gettext("fwknopd restart was requested.");
@@ -126,6 +139,9 @@ if ($_POST && isset($_POST['act'])) {
 
 $settings = fwknop_get_settings();
 $rules = fwknop_get_access_rules();
+$runtime_missing = fwknop_runtime_missing_components();
+$runtime_ready = empty($runtime_missing);
+$runtime_message = fwknop_runtime_status_message();
 $service_running = fwknop_service_status();
 $file_status = array(
 	FWKNOP_FWKNOPD_CONF => fwknop_gui_file_status(FWKNOP_FWKNOPD_CONF),
@@ -149,6 +165,10 @@ fwknop_gui_tabs("status");
 
 <?=print_info_box(gettext("Single Packet Authorization is not a VPN replacement. It controls when selected services are reachable; it does not encrypt or tunnel the protected traffic."), 'warning', null)?>
 
+<?php if (!$runtime_ready): ?>
+	<?=print_info_box(fwknop_gui_h($runtime_message), 'danger', null)?>
+<?php endif; ?>
+
 <?php foreach ($exposure_warnings as $warning): ?>
 	<?=print_info_box(fwknop_gui_h($warning), 'warning', null)?>
 <?php endforeach; ?>
@@ -158,8 +178,18 @@ fwknop_gui_tabs("status");
 	<div class="panel-body">
 		<p>
 			<strong><?=gettext("Status")?>:</strong>
-			<?=($service_running ? gettext("Running") : gettext("Stopped"))?>
+			<?php if (!$runtime_ready): ?>
+				<?=gettext("Unavailable (runtime missing)")?>
+			<?php else: ?>
+				<?=($service_running ? gettext("Running") : gettext("Stopped"))?>
+			<?php endif; ?>
 		</p>
+		<?php if (!$runtime_ready): ?>
+			<p>
+				<strong><?=gettext("Missing runtime components")?>:</strong>
+				<?=fwknop_gui_h(fwknop_gui_runtime_missing_summary($runtime_missing))?>
+			</p>
+		<?php endif; ?>
 		<form method="post" name="fwknopactions" id="fwknopactions">
 			<button type="submit" name="act" value="configtest" class="btn btn-primary btn-sm">
 				<i class="fa-solid fa-list-check icon-embed-btn"></i>
@@ -169,7 +199,7 @@ fwknop_gui_tabs("status");
 				<i class="fa-solid fa-rotate icon-embed-btn"></i>
 				<?=gettext("Resync")?>
 			</button>
-			<button type="submit" name="act" value="restart" class="btn btn-warning btn-sm">
+			<button type="submit" name="act" value="restart" class="btn btn-warning btn-sm" <?=(!$runtime_ready ? 'disabled="disabled"' : '')?>>
 				<i class="fa-solid fa-power-off icon-embed-btn"></i>
 				<?=gettext("Restart fwknopd")?>
 			</button>

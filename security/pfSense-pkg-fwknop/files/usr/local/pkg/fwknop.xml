@@ -69,11 +69,10 @@
 			</options>
 		</field>
 		<field>
-			<fielddescr>Listen Interfaces</fielddescr>
+			<fielddescr>Listen Interface</fielddescr>
 			<fieldname>listen_interfaces</fieldname>
 			<type>interfaces_selection</type>
-			<description>Select the interfaces where fwknopd should receive SPA packets.</description>
-			<multiple/>
+			<description>Select the interface where fwknopd should receive SPA packets.</description>
 		</field>
 		<field>
 			<fielddescr>SPA Packet Port</fielddescr>

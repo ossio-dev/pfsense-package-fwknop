@@ -13,13 +13,16 @@ require_once("services.inc");
 require_once("util.inc");
 
 define('FWKNOP_CONFIG_PATH', 'installedpackages/fwknop/config/0');
-define('FWKNOP_RULE_PATH', 'installedpackages/fwknop/accessrule');
+define('FWKNOP_RULE_PATH', 'fwknop/accessrule');
 define('FWKNOP_LEGACY_RULE_PATH', 'installedpackages/fwknop/rule');
+define('FWKNOP_LEGACY_PACKAGE_RULE_PATH', 'installedpackages/fwknop/accessrule');
+define('FWKNOP_LEGACY_CONFIG_RULE_PATH', 'installedpackages/fwknop/config/0/accessrule');
 define('FWKNOP_ETCDIR', '/usr/local/etc/fwknop');
 define('FWKNOP_ACCESS_D_DIR', FWKNOP_ETCDIR . '/access.d');
 define('FWKNOP_FWKNOPD_CONF', FWKNOP_ETCDIR . '/fwknopd.conf');
 define('FWKNOP_ACCESS_CONF', FWKNOP_ETCDIR . '/access.conf');
 define('FWKNOP_TABLE_HELPER', '/usr/local/sbin/pfsense-fwknop-table');
+define('FWKNOPD_BINARY', '/usr/local/sbin/fwknopd');
 define('FWKNOP_RC_SCRIPT', '/usr/local/etc/rc.d/fwknopd');
 define('LOG_PREFIX_PKG_FWKNOP', 'fwknop');
 
@@ -46,6 +49,48 @@ function fwknop_get_settings() {
 	return array_replace(fwknop_default_settings(), $settings);
 }
 
+function fwknop_runtime_components() {
+	return [
+		gettext('fwknopd binary') => FWKNOPD_BINARY,
+		gettext('fwknopd rc script') => FWKNOP_RC_SCRIPT
+	];
+}
+
+function fwknop_runtime_missing_components() {
+	$missing = [];
+	foreach (fwknop_runtime_components() as $name => $path) {
+		if (!file_exists($path) || !is_executable($path)) {
+			$missing[] = [
+				'name' => $name,
+				'path' => $path
+			];
+		}
+	}
+
+	return $missing;
+}
+
+function fwknop_runtime_available() {
+	return empty(fwknop_runtime_missing_components());
+}
+
+function fwknop_runtime_status_message() {
+	$missing = fwknop_runtime_missing_components();
+	if (empty($missing)) {
+		return '';
+	}
+
+	$details = [];
+	foreach ($missing as $component) {
+		$details[] = sprintf('%s (%s)', $component['name'], $component['path']);
+	}
+
+	return sprintf(
+		gettext('fwknop runtime components are missing: %s. Install the security/fwknop runtime package before enabling or restarting the pfSense fwknop package.'),
+		implode(', ', $details)
+	);
+}
+
 function fwknop_install_command() {
 	fwknop_make_directories();
 
@@ -69,12 +114,24 @@ function fwknop_deinstall_command() {
 	fwknop_remove_generated_files();
 }
 
+function fwknop_can_reload_filter() {
+	return function_exists('filter_configure') &&
+		(!function_exists('platform_booting') || !platform_booting());
+}
+
+function fwknop_reload_filter() {
+	if (fwknop_can_reload_filter()) {
+		filter_configure();
+	}
+}
+
 function fwknop_resync_config() {
 	$settings = fwknop_get_settings();
 
 	if (!fwknop_is_enabled($settings)) {
 		fwknop_stop();
 		fwknop_remove_generated_files();
+		fwknop_reload_filter();
 		return;
 	}
 
@@ -84,6 +141,16 @@ function fwknop_resync_config() {
 
 	if (function_exists('fwknop_write_table_helper')) {
 		fwknop_write_table_helper();
+	}
+
+	if (!fwknop_runtime_available()) {
+		fwknop_log_warning(fwknop_runtime_status_message());
+		fwknop_reload_filter();
+		return;
+	}
+
+	if (fwknop_can_reload_filter()) {
+		fwknop_reload_filter();
 	}
 
 	if (!function_exists('platform_booting') || !platform_booting()) {
@@ -107,6 +174,13 @@ function fwknop_validate_config($post, &$input_errors) {
 		if (!fwknop_is_valid_interface($interface)) {
 			$input_errors[] = sprintf(gettext("The listen interface '%s' is not a valid pfSense interface."), $interface);
 		}
+	}
+	if (count($listen_interfaces) > 1) {
+		$input_errors[] = gettext("Select only one listen interface. The current fwknop package integration supports a single capture interface.");
+	}
+
+	if (fwknop_is_enabled($settings) && !fwknop_runtime_available()) {
+		$input_errors[] = fwknop_runtime_status_message();
 	}
 
 	$pcap_filter = trim((string)fwknop_array_get($settings, 'pcap_filter_override', ''));
@@ -132,6 +206,10 @@ function fwknop_validate_config($post, &$input_errors) {
 }
 
 function fwknop_service_status() {
+	if (!fwknop_runtime_available()) {
+		return false;
+	}
+
 	if (function_exists('is_service_running')) {
 		return is_service_running('fwknopd');
 	}
@@ -146,6 +224,11 @@ function fwknop_service_status() {
 }
 
 function fwknop_start() {
+	if (!fwknop_runtime_available()) {
+		fwknop_log_warning(fwknop_runtime_status_message());
+		return false;
+	}
+
 	if (function_exists('start_service')) {
 		return start_service('fwknopd');
 	}
@@ -157,6 +240,10 @@ function fwknop_start() {
 }
 
 function fwknop_stop() {
+	if (!fwknop_runtime_available()) {
+		return false;
+	}
+
 	if (function_exists('stop_service')) {
 		return stop_service('fwknopd');
 	}
@@ -168,6 +255,11 @@ function fwknop_stop() {
 }
 
 function fwknop_restart() {
+	if (!fwknop_runtime_available()) {
+		fwknop_log_warning(fwknop_runtime_status_message());
+		return false;
+	}
+
 	if (function_exists('restart_service')) {
 		return restart_service('fwknopd');
 	}
@@ -199,6 +291,10 @@ function fwknop_build_fwknopd_conf($settings) {
 	$settings = array_replace(fwknop_default_settings(), is_array($settings) ? $settings : []);
 	$spa_port = fwknop_is_port($settings['spa_port']) ? $settings['spa_port'] : '62201';
 	$interfaces = fwknop_get_real_interfaces(fwknop_normalize_list($settings['listen_interfaces']));
+	if (count($interfaces) > 1) {
+		fwknop_log_warning('Multiple fwknop listen interfaces were configured. Only the first interface will be used for fwknopd packet capture.');
+		$interfaces = [reset($interfaces)];
+	}
 	$pcap_interface = reset($interfaces);
 	$pcap_filter = trim((string)$settings['pcap_filter_override']);
 	if ($pcap_filter === '') {
@@ -213,9 +309,6 @@ function fwknop_build_fwknopd_conf($settings) {
 
 	if (!empty($pcap_interface)) {
 		$lines[] = "PCAP_INTF {$pcap_interface};";
-		if (count($interfaces) > 1) {
-			$lines[] = '# Additional selected interfaces: ' . implode(', ', array_slice($interfaces, 1));
-		}
 	}
 
 	$lines[] = 'ENABLE_PCAP_PROMISC N;';
@@ -424,10 +517,25 @@ function fwknop_atomic_write($path, $content, $mode) {
 function fwknop_get_access_rules() {
 	$rules = config_get_path(FWKNOP_RULE_PATH, []);
 	if (empty($rules)) {
+		$rules = config_get_path(FWKNOP_LEGACY_CONFIG_RULE_PATH, []);
+	}
+	if (empty($rules)) {
+		$rules = config_get_path(FWKNOP_LEGACY_PACKAGE_RULE_PATH, []);
+	}
+	if (empty($rules)) {
 		$rules = config_get_path(FWKNOP_LEGACY_RULE_PATH, []);
 	}
 
 	return fwknop_normalize_rule_list($rules);
+}
+
+function fwknop_set_access_rules($rules) {
+	config_set_path(FWKNOP_RULE_PATH, array('item' => array_values(fwknop_normalize_rule_list($rules))));
+	if (function_exists('config_del_path')) {
+		config_del_path(FWKNOP_LEGACY_CONFIG_RULE_PATH);
+		config_del_path(FWKNOP_LEGACY_PACKAGE_RULE_PATH);
+		config_del_path(FWKNOP_LEGACY_RULE_PATH);
+	}
 }
 
 function fwknop_get_posted_access_rules($post) {
@@ -730,6 +838,14 @@ function fwknop_destination_for_rule($rule) {
 	$value = trim((string)fwknop_array_get($rule, 'destination_value', ''));
 	if ($type === 'firewall' || $value === '') {
 		return '';
+	}
+	if ($type === 'interface') {
+		if (!fwknop_is_valid_interface($value)) {
+			return '';
+		}
+
+		$interface_ip = function_exists('get_interface_ip') ? get_interface_ip($value) : '';
+		return $interface_ip !== '' ? fwknop_safe_directive_value($interface_ip) : '';
 	}
 	if ($type === 'alias' && function_exists('filter_expand_alias')) {
 		$expanded = trim(filter_expand_alias($value));
